@@ -98,7 +98,7 @@ class AudioDataset(Dataset):
         return len(self.sequences)
     
     def __getitem__(self, idx):
-        return torch.tensor(self.sequences[idx], dtype=torch.float32) # removed device = device as Pytorch doesn't support GPU data processing. So we're going to use pin_memory = True which as synchronously sends data to the GPU and the dataloaded will then expect the data to come from the CPU to GPU. 
+        return torch.tensor(self.sequences[idx], dtype=torch.float32) # removed device = device as Pytorch doesn't support GPU data processing. So we're going to use pin_memory = True which asynchronously sends data to the GPU and the dataloader will then expect the data to come from the CPU to GPU. 
 
 def train_sequence(model, sequence, criterion, optimizer):
     """Process the sequence with state retention"""
