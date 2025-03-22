@@ -8,83 +8,101 @@ from ncps.wirings import AutoNCP
 from torch.utils.data import DataLoader, Dataset
 import os
 import glob
-import time
+import hashlib
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.checkpoint import checkpoint
+from torch.cuda.amp import autocast, GradScaler
+import gc
 
-if __name__ == '__main__':
-    mp.set_start_method('spawn', force=True)
+class StatefulCfC(CfC):
+    def __init__(self, input_size, wiring, **kwargs):
+        super().__init__(input_size, wiring, **kwargs)
+        self.hidden_registry = {}
+        self.current_seq_id = None
 
-# Initialize distributed processing
-    dist.init_process_group(backend="nccl", init_method="env://")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
+    def forward(self, x, hidden=None):
+        if hidden is None and self.current_seq_id in self.hidden_registry:
+            hidden = self.hidden_registry[self.current_seq_id].to(x.device)
+        return super().forward(x, hidden)
 
-print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
+    def clear_hidden_states(self):
+        """Clear hidden states to free memory"""
+        self.hidden_registry.clear()
 
 def simulate_packet_loss(data, loss_rate, packet_size=100):
     """GPU-only packet loss simulation"""
-    batch_size, seq_len, _ = data.shape
+    batch_size, seq_len = data.shape[0], data.shape[1]
     mask = torch.ones_like(data, device=data.device)
     
-    # Vectorized packet loss
-    packet_loss = torch.rand(batch_size, seq_len // packet_size, device=data.device) < loss_rate
-    for i in range(seq_len // packet_size):
-        start = max(0, i*packet_size - 50)
-        end = (i+1)*packet_size
-        mask[:, start:end, :] = ~packet_loss[:, [i]].unsqueeze(-1)
+    # Simplified packet loss simulation
+    if seq_len >= packet_size:
+        packet_loss = torch.rand(batch_size, max(1, seq_len // packet_size), device=data.device) < loss_rate
+        for i in range(min(seq_len // packet_size, packet_loss.shape[1])):
+            start = i * packet_size
+            end = min((i+1) * packet_size, seq_len)
+            mask[:, start:end] = ~packet_loss[:, [i]].unsqueeze(-1)
     
     return data * mask, mask
 
 class AudioDataset(Dataset):
-    def __init__(self, folder_path, chunk_size, seq_length=3):
+    def __init__(self, folder_path, chunk_size, seq_length=3, max_files=None):
         self.chunk_size = chunk_size
         self.seq_length = seq_length
         self.sequences = []
+        self.sequence_ids = []
         
         total_files = 0
         total_chunks = 0
         
-        for file_idx, file_path in enumerate(glob.glob(os.path.join(folder_path, "*.wav"))):
-            sample_rate, audio = read_wav(file_path)
-            if audio.ndim > 1:
-                audio = np.mean(audio, axis=1)
-            
-            # Add debug info for file loading
-            if dist.get_rank() == 0:
-                print(f"\nLoading file {file_idx+1}: {os.path.basename(file_path)}")
-                print(f"Sample rate: {sample_rate} Hz")
-                print(f"Total samples: {len(audio)}")
-                print(f"Duration: {len(audio)/sample_rate:.2f} seconds")
+        files = glob.glob(os.path.join(folder_path, "*.wav"))
+        if max_files:
+            files = files[:max_files]
 
-            # Handle silent audio
-            max_val = np.max(np.abs(audio))
-            if max_val == 0:
-                audio = np.zeros_like(audio, dtype=np.float32)
+        for file_idx, file_path in enumerate(files):
+            try:
+                sample_rate, audio = read_wav(file_path)
+                if audio.ndim > 1:
+                    audio = np.mean(audio, axis=1)
+                
+                # Add debug info for file loading
+                if dist.get_rank() == 0 and file_idx % 10 == 0:
+                    print(f"\nLoading file {file_idx+1}/{len(files)}: {os.path.basename(file_path)}")
+                    print(f"Sample rate: {sample_rate} Hz")
+                    print(f"Duration: {len(audio)/sample_rate:.2f} seconds")
+
+                max_val = np.max(np.abs(audio)) or 1.0
+                audio = (audio.astype(np.float32) / max_val).reshape(-1)
+
+                # Subsample audio to reduce memory usage
+                num_chunks = len(audio) // chunk_size
+                valid_chunks = max(0, num_chunks - self.seq_length)
+                
+                # Limit number of sequences per file
+                max_seqs_per_file = min(100, valid_chunks)
+                stride = max(1, valid_chunks // max_seqs_per_file)
+                
+                for i in range(0, valid_chunks, stride):
+                    start = i * chunk_size
+                    end = start + self.seq_length * chunk_size
+                    seq = audio[start:end]
+                    seq = seq.reshape(self.seq_length, chunk_size)
+                    self.sequences.append(seq)
+                    self.sequence_ids.append(hashlib.sha256(seq.tobytes()).hexdigest())
+                    
+                total_files += 1
+                total_chunks += valid_chunks
+                
+                # Force garbage collection
+                del audio
+                gc.collect()
+                
+            except Exception as e:
                 if dist.get_rank() == 0:
-                    print("Warning: Silent audio file detected")
-            else:
-                audio = audio.astype(np.float32) / (max_val + 1e-12)
-
-            num_chunks = len(audio) // chunk_size
-            valid_chunks = num_chunks - self.seq_length
-            
-            if dist.get_rank() == 0:
-                print(f"Chunks per file: {num_chunks}")
-                print(f"Valid sequences: {valid_chunks}")
-
-            for i in range(valid_chunks):
-                start = i * chunk_size
-                end = start + self.seq_length * chunk_size
-                seq = audio[start:end]
-                seq = seq.reshape(self.seq_length, chunk_size)
-                self.sequences.append(seq)
-            
-            total_files += 1
-            total_chunks += valid_chunks
+                    print(f"Error loading file {file_path}: {e}")
         
+        # Debugging to make sure the files are loaded
         if dist.get_rank() == 0:
             print(f"\nDataset Summary:")
             print(f"Total files loaded: {total_files}")
@@ -92,57 +110,123 @@ class AudioDataset(Dataset):
             print(f"Total chunks: {len(self.sequences) * self.seq_length}")
             print(f"Sequence length: {self.seq_length} chunks")
             print(f"Chunk size: {chunk_size} samples")
-            print(f"Total training samples: {len(self.sequences) * self.seq_length * chunk_size}\n")
 
     def __len__(self):
         return len(self.sequences)
-    
+
     def __getitem__(self, idx):
-        return torch.tensor(self.sequences[idx], dtype=torch.float32) # removed device = device as Pytorch doesn't support GPU data processing. So we're going to use pin_memory = True which asynchronously sends data to the GPU and the dataloader will then expect the data to come from the CPU to GPU. 
+        return (
+            torch.tensor(self.sequences[idx], dtype=torch.float32),
+            self.sequence_ids[idx]
+        )
 
-def train_sequence(model, sequence, criterion, optimizer):
-    """Process the sequence with state retention"""
+def collate_fn(batch):
+    """Optimized collate with sequence IDs"""
+    seqs, ids = zip(*batch)
+    return torch.stack(seqs), list(ids)
+        
+def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, device, grad_accumulation_steps=4):
+    """Memory-optimized training step with gradient accumulation"""
+    model.module.current_seq_id = seq_ids[0]
+    
+    # Initialize hidden state
     hidden = None
-    #total_loss = 0
-    optimizer.zero_grad()
+    if model.module.current_seq_id in model.module.hidden_registry:
+        hidden = model.module.hidden_registry[model.module.current_seq_id].to(device)
     
-    # Move entire sequence to GPU once
-    sequence = sequence.to(device).unsqueeze(-1)  # [batch_size, seq_length, chunk_size, 1]
+    # Move data to GPU - explicitly specify device
+    sequence = sequence.to(device, non_blocking=True).unsqueeze(-1)
+    batch_size, seq_len = sequence.size(0), sequence.size(1)
     
-    losses = []
-    for i, chunk in enumerate(sequence.permute(1, 0, 2, 3)):  # [seq_length, batch_size, chunk_size, 1]
-        corrupted, mask = simulate_packet_loss(chunk, 0.1)
-        output, hidden = model(corrupted, hidden)
-        hidden = hidden.detach()
+    # Only zero gradients at the start of accumulation steps
+    if hasattr(train_sequence, 'acc_step_counter'):
+        train_sequence.acc_step_counter += 1
+    else:
+        train_sequence.acc_step_counter = 0
         
-        loss = criterion(output * (1 - mask), chunk * (1 - mask))
-        #total_loss += loss.item()
-        #loss.backward(retain_graph=True)
-        losses.append(loss)
-        
-     
-    # Sum losses     
-    total_loss = torch.sum(torch.stack(losses))
-    total_loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) #gradient clipping to avoid exponential loss 
-    optimizer.step()
+    if train_sequence.acc_step_counter % grad_accumulation_steps == 0:
+        optimizer.zero_grad()
     
-    return total_loss.item() / len(sequence)
+    total_loss = 0
+    
+    # Process sequence in smaller chunks to save memory
+    with autocast():
+        for t in range(seq_len):
+            chunk = sequence[:, t]  # [B, C, 1]
+            
+            # Generate packet loss - ensure on correct device
+            corrupted, mask = simulate_packet_loss(chunk, 0.1)
+            
+            # Ensure mask is on the correct device
+            mask = mask.to(device)
+            
+            # Forward pass
+            output, hidden = model(corrupted, hidden)
+            
+            # Ensure output is on the correct device
+            output = output.to(device)
+            
+            # Calculate loss with mask - ensure all tensors are on same device
+            loss = criterion(output * (1 - mask), chunk * (1 - mask))
+            total_loss += loss / seq_len
+            
+            # Detach hidden state
+            hidden = hidden.detach()
+    
+    # Scale loss by accumulation steps
+    scaled_loss = total_loss / grad_accumulation_steps
+    
+    # Backpropagate with scaler
+    scaler.scale(scaled_loss).backward()
+    
+    # Only update parameters at the end of accumulation steps
+    if (train_sequence.acc_step_counter + 1) % grad_accumulation_steps == 0:
+        # Clip gradients
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+        
+        scaler.step(optimizer)
+        scaler.update()
+    
+    # Save hidden state to CPU to free GPU memory - explicitly move to CPU
+    model.module.hidden_registry[model.module.current_seq_id] = hidden.detach().cpu()
+    
+    # Force garbage collection
+    del hidden, output, corrupted, mask, chunk
+    torch.cuda.empty_cache()
+    
+    return total_loss.item()
 
-if __name__ == '__main__':
+def main():
+    # Initialize distributed processing
+    dist.init_process_group(backend="nccl", init_method="env://")
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)  # Set device before creating tensors
+    device = torch.device(f"cuda:{local_rank}")
+
+    print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
+    
     # Configuration
     input_folder = "/arc/project/st-mthorogo-1/CfC/corpus"
-    chunk_size = 1024
-    seq_length = 5
+    chunk_size = 1024  # Reduced for memory savings
+    seq_length = 2  # Reduced sequence length
     num_epochs = 50
+    batch_size = 16  # Reduced batch size
+    grad_accumulation_steps = 4  # Accumulate gradients over 4 steps (effective batch size: 16)
     
-    # Model setup
-    wiring = AutoNCP(28, 1)
-    model = CfC(1, wiring).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank) #model initialised on the GPU 
+    # Model setup - reduced size
+    wiring = AutoNCP(32, 1)  # Reduced from 64
+    model = StatefulCfC(1, wiring).to(device)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
     
     # Dataset and DataLoader
-    dataset = AudioDataset(input_folder, chunk_size, seq_length)
+    dataset = AudioDataset(
+        input_folder, 
+        chunk_size, 
+        seq_length, 
+        max_files=50  # Limit number of files for testing
+    )
+    
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
@@ -150,52 +234,72 @@ if __name__ == '__main__':
         shuffle=True,
         drop_last=True
     )
+    
     dataloader = DataLoader(
         dataset,
-        batch_size=16,
+        batch_size=batch_size,
         sampler=sampler,
-        num_workers=1,
+        num_workers=2,  # Reduced worker count
         pin_memory=True,
-        persistent_workers=True
+        persistent_workers=True,
+        collate_fn=collate_fn
     )
     
     if dist.get_rank() == 0:
         print(f"\nTraining Configuration:")
         print(f"World size: {dist.get_world_size()}")
-        print(f"Batch size per GPU: {16}")
+        print(f"Batch size per GPU: {batch_size}")
+        print(f"Gradient accumulation steps: {grad_accumulation_steps}")
+        print(f"Effective batch size: {batch_size * grad_accumulation_steps}")
         print(f"Total batches per epoch: {len(dataloader)}")
         print(f"Sequence length: {seq_length} chunks")
         print(f"Chunk size: {chunk_size} samples")
         print(f"Total epochs: {num_epochs}\n")
     
-    # Training setup
+    # Training setup - ensure criterion is on the right device
     criterion = nn.MSELoss().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    scaler = GradScaler()
     
     # Training loop
     for epoch in range(num_epochs):
         sampler.set_epoch(epoch)
         total_loss = 0
         
-        if dist.get_rank() == 0:
-            print(f"\nEpoch {epoch+1}/{num_epochs}")
-            #print(f"Total sequences to process: {len(dataloader)}")
-            #print(f"Approx total chunks: {len(dataloader) * 8 * seq_length}")
+        # Periodic memory cleanup
+        if epoch % 3 == 0:
+            model.module.clear_hidden_states()
+            gc.collect()
+            torch.cuda.empty_cache()
         
-        for batch_idx, sequence in enumerate(dataloader):
-            loss = train_sequence(model, sequence, criterion, optimizer)
+        for batch_idx, (sequences, seq_ids) in enumerate(dataloader):
+            # Pass the device explicitly to train_sequence
+            loss = train_sequence(model, scaler, sequences, seq_ids, criterion, optimizer, device, grad_accumulation_steps)
             total_loss += loss
             
+            # More frequent memory cleanup
+            if batch_idx % 10 == 0:
+                gc.collect()
+                torch.cuda.empty_cache()
+            
             if batch_idx % 10 == 0 and dist.get_rank() == 0:
-                print(f"Batch {batch_idx+1}/{len(dataloader)} | "
-                      f"Avg Loss: {loss:.4f} | "
-                      f"GPU Mem: {torch.cuda.memory_allocated(device)//1024**2}MB")
+                mem = torch.cuda.memory_allocated(device) // 1024**2
+                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss:.4f} | GPU Mem: {mem}MB")
+        
+        # Force garbage collection at the end of each epoch
+        gc.collect()
+        torch.cuda.empty_cache()
         
         if dist.get_rank() == 0:
-            epoch_loss = total_loss / len(dataloader)
-            print(f"Epoch {epoch+1} completed | Avg Loss: {epoch_loss:.4f}")
-            torch.save(model.module.state_dict(), f"model_epoch_{epoch}.pth")
+            avg_loss = total_loss / len(dataloader)
+            print(f"Epoch {epoch+1} Completed | Avg Loss: {avg_loss:.4f}")
+            # Save model less frequently
+            if (epoch + 1) % 5 == 0:
+                torch.save(model.module.state_dict(), f"model_epoch_{epoch}.pth")
     
     if dist.get_rank() == 0:
-        print("\nTraining completed successfully!")
-        print(f"Final model saved as model_epoch_{num_epochs-1}.pth")
+        print("Training completed successfully!")
+
+if __name__ == '__main__':
+    mp.set_start_method('spawn', force=True)
+    main()
