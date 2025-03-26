@@ -24,12 +24,14 @@ class StatefulCfC(CfC):
 
     def forward(self, x, hidden=None):
         if hidden is None and self.current_seq_id in self.hidden_registry:
-            hidden = self.hidden_registry[self.current_seq_id].to(x.device)
-        return super().forward(x, hidden)
+            hidden = self.hidden_registry[self.current_seq_id].to(x.device, non_blocking=True)
+        
+        output,new_hidden = super().forward(x,hidden)
+        return output, new_hidden
 
-    def clear_hidden_states(self):
+   # def clear_hidden_states(self):
         """Clear hidden states to free memory"""
-        self.hidden_registry.clear()
+       # self.hidden_registry.clear()
 
 def simulate_packet_loss(data, loss_rate, packet_size=100):
     """GPU-only packet loss simulation"""
@@ -147,34 +149,28 @@ def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, devic
     if train_sequence.acc_step_counter % grad_accumulation_steps == 0:
         optimizer.zero_grad()
     
-    total_loss = 0
     
     # Process sequence in smaller chunks to save memory
     with autocast():
-        for t in range(seq_len):
-            chunk = sequence[:, t]  # [B, C, 1]
+        corrupted, mask = simulate_packet_loss(sequence, 0.1)
+        outputs = []
+        
+        
+        # Batch forward passes over time steps
+        for t in range(sequence.size(1)):
+            output, hidden = model(corrupted[:, t], hidden)
+            outputs.append(output)
+        
+        # Combine outputs and calculate loss
+        outputs = torch.stack(outputs, dim=1)
+        loss = criterion(outputs * mask, sequence * mask) #calculates loss only on the masked regions 
+    
             
-            # Generate packet loss - ensure on correct device
-            corrupted, mask = simulate_packet_loss(chunk, 0.1)
-            
-            # Ensure mask is on the correct device
-            mask = mask.to(device)
-            
-            # Forward pass
-            output, hidden = model(corrupted, hidden)
-            
-            # Ensure output is on the correct device
-            output = output.to(device)
-            
-            # Calculate loss with mask - ensure all tensors are on same device
-            loss = criterion(output * (1 - mask), chunk * (1 - mask))
-            total_loss += loss / seq_len
-            
-            # Detach hidden state
-            hidden = hidden.detach()
+         # Detach hidden state
+        hidden = hidden.detach()
     
     # Scale loss by accumulation steps
-    scaled_loss = total_loss / grad_accumulation_steps
+    scaled_loss = loss / grad_accumulation_steps
     
     # Backpropagate with scaler
     scaler.scale(scaled_loss).backward()
@@ -188,21 +184,22 @@ def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, devic
         scaler.step(optimizer)
         scaler.update()
     
-    # Save hidden state to CPU to free GPU memory - explicitly move to CPU
-    model.module.hidden_registry[model.module.current_seq_id] = hidden.detach().cpu()
+    # Save hidden state to CPU to free GPU memory - explicitly move to CPU. We are going to yolo it and remove them from the CPU 
+    model.module.hidden_registry[model.module.current_seq_id] = hidden.detach()
     
     # Force garbage collection
-    del hidden, output, corrupted, mask, chunk
-    torch.cuda.empty_cache()
+    #del hidden, output, corrupted, mask
+    #torch.cuda.empty_cache()
     
-    return total_loss.item()
+    loss_value = loss.item()
+    return loss_value
 
 def main():
     # Initialize distributed processing
     dist.init_process_group(backend="nccl", init_method="env://")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)  # Set device before creating tensors
-    device = torch.device(f"cuda:{local_rank}")
+    device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
 
     print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
     
@@ -267,10 +264,10 @@ def main():
         total_loss = 0
         
         # Periodic memory cleanup
-        if epoch % 3 == 0:
-            model.module.clear_hidden_states()
-            gc.collect()
-            torch.cuda.empty_cache()
+        #if epoch % 3 == 0:
+           # model.module.clear_hidden_states()
+            #gc.collect()
+            #torch.cuda.empty_cache()
         
         for batch_idx, (sequences, seq_ids) in enumerate(dataloader):
             # Pass the device explicitly to train_sequence
@@ -278,17 +275,17 @@ def main():
             total_loss += loss
             
             # More frequent memory cleanup
-            if batch_idx % 10 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+            #if batch_idx % 10 == 0:
+                #gc.collect()
+                #torch.cuda.empty_cache()
             
             if batch_idx % 10 == 0 and dist.get_rank() == 0:
                 mem = torch.cuda.memory_allocated(device) // 1024**2
                 print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss:.4f} | GPU Mem: {mem}MB")
         
         # Force garbage collection at the end of each epoch
-        gc.collect()
-        torch.cuda.empty_cache()
+       # gc.collect()
+       # torch.cuda.empty_cache()
         
         if dist.get_rank() == 0:
             avg_loss = total_loss / len(dataloader)
@@ -299,7 +296,7 @@ def main():
     
     if dist.get_rank() == 0:
         print("Training completed successfully!")
-
+    
 if __name__ == '__main__':
     mp.set_start_method('spawn', force=True)
     main()
