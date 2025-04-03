@@ -1,3 +1,6 @@
+import os 
+# setting memory fragmentation v v imp: will split individual mem block to 128MB 
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import torch
 import torch.multiprocessing as mp
 import torch.nn as nn
@@ -6,7 +9,6 @@ from scipy.io.wavfile import read as read_wav
 from ncps.torch import CfC
 from ncps.wirings import AutoNCP
 from torch.utils.data import DataLoader, Dataset
-import os
 import glob
 import hashlib
 import torch.distributed as dist
@@ -58,7 +60,7 @@ class AudioDataset(Dataset):
         total_files = 0
         total_chunks = 0
         
-        files = glob.glob(os.path.join(folder_path, "*.wav"))
+        files = glob.glob(os.path.join(folder_path, "*.wav")) #all the .wav files in the folder 
         if max_files:
             files = files[:max_files]
 
@@ -97,8 +99,8 @@ class AudioDataset(Dataset):
                 total_chunks += valid_chunks
                 
                 # Force garbage collection
-                del audio
-                gc.collect()
+                #del audio
+                #gc.collect()
                 
             except Exception as e:
                 if dist.get_rank() == 0:
@@ -136,7 +138,7 @@ def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, devic
     if model.module.current_seq_id in model.module.hidden_registry:
         hidden = model.module.hidden_registry[model.module.current_seq_id].to(device)
     
-    # Move data to GPU - explicitly specify device
+    # Move data to GPU - explicitly specify device (hmmm something looks phishy)
     sequence = sequence.to(device, non_blocking=True).unsqueeze(-1)
     batch_size, seq_len = sequence.size(0), sequence.size(1)
     
@@ -147,17 +149,17 @@ def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, devic
         train_sequence.acc_step_counter = 0
         
     if train_sequence.acc_step_counter % grad_accumulation_steps == 0:
-        optimizer.zero_grad()
+        optimizer.zero_grad(set_to_none= True)
     
     
     # Process sequence in smaller chunks to save memory
-    with autocast():
+    with torch.cuda.amp.autocast():
         corrupted, mask = simulate_packet_loss(sequence, 0.1)
         outputs = []
         
         
-        # Batch forward passes over time steps
-        for t in range(sequence.size(1)):
+        # Batch forward passes over time steps , a change was made here from "sequence.size(1)" to "seq_len"
+        for t in range(seq_len):
             output, hidden = model(corrupted[:, t], hidden)
             outputs.append(output)
         
@@ -166,33 +168,42 @@ def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, devic
         loss = criterion(outputs * mask, sequence * mask) #calculates loss only on the masked regions 
     
             
-         # Detach hidden state
-        hidden = hidden.detach()
+         # Detach hidden state. This is what needs to be optimised cause commenting this out leads to "leaked semaphore objects"
+        #hidden = hidden.detach()
     
     # Scale loss by accumulation steps
     scaled_loss = loss / grad_accumulation_steps
     
-    # Backpropagate with scaler
-    scaler.scale(scaled_loss).backward()
-    
-    # Only update parameters at the end of accumulation steps
+    # Backpropagate with scaler. Other alt: using Truncated Backpropagation Through Time (TBPTT): breaks down the sequence into smaller chunks and performs backpropagation only over these chunks, effectively truncating the backpropagation process
+    #scaler.scale(scaled_loss).backward(retain_graph=True) #keeping the graph alive by not freeing it up 
+    # Only update parameters at the end of accumulation steps or what we can do is "if this is not the final accumulation step, retain the graph".
     if (train_sequence.acc_step_counter + 1) % grad_accumulation_steps == 0:
+        scaler.scale(scaled_loss).backward() #Final step in accumulation: no need to backward pass 
+        
         # Clip gradients
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         
         scaler.step(optimizer)
         scaler.update()
+        
+        #conditional detachment: truncating the graph aka TBPTT
+        hidden=hidden.detach()
+    else:
+        scaler.scale(scaled_loss).backward(retain_graph=True)
     
-    # Save hidden state to CPU to free GPU memory - explicitly move to CPU. We are going to yolo it and remove them from the CPU 
-    model.module.hidden_registry[model.module.current_seq_id] = hidden.detach()
+    # Save hidden state to CPU to free GPU memory - explicitly move to CPU. We are going make a conditional move of the hidden states from the GPU to CPU: when GPU mem exceeds 80% automatically move them to the CPU
+    if torch.cuda.memory_reserved(device) / torch.cuda.get_device_properties(device).total_memory < 0.8:
+         model.module.hidden_registry[model.module.current_seq_id] = hidden
+    else: 
+        model.module.hidden_registry[model.module.current_seq_id] = hidden.detach().cpu()
     
     # Force garbage collection
     #del hidden, output, corrupted, mask
     #torch.cuda.empty_cache()
     
-    loss_value = loss.item()
-    return loss_value
+    #loss_value = loss.item()
+    return loss.item()
 
 def main():
     # Initialize distributed processing
@@ -200,28 +211,27 @@ def main():
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)  # Set device before creating tensors
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-
     print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
     
     # Configuration
     input_folder = "/arc/project/st-mthorogo-1/CfC/corpus"
-    chunk_size = 1024  # Reduced for memory savings
-    seq_length = 2  # Reduced sequence length
+    chunk_size = 512  # Reduced for memory savings
+    seq_length = 3  # Reduced sequence length
     num_epochs = 50
     batch_size = 16  # Reduced batch size
     grad_accumulation_steps = 4  # Accumulate gradients over 4 steps (effective batch size: 16)
     
     # Model setup - reduced size
-    wiring = AutoNCP(32, 1)  # Reduced from 64
+    wiring = AutoNCP(64, 1) 
     model = StatefulCfC(1, wiring).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
     
     # Dataset and DataLoader
     dataset = AudioDataset(
         input_folder, 
         chunk_size, 
         seq_length, 
-        max_files=50  # Limit number of files for testing
+        max_files=3968  # Limit number of files for testing
     )
     
     sampler = DistributedSampler(
@@ -237,7 +247,7 @@ def main():
         batch_size=batch_size,
         sampler=sampler,
         num_workers=2,  # Reduced worker count
-        pin_memory=True,
+        pin_memory=True, # pin_memory argument, which defaults to False. When using a GPU it’s better to set pin_memory=True, this instructs DataLoader to use pinned memory and enables faster and asynchronous memory copy from the host to the GPU.
         persistent_workers=True,
         collate_fn=collate_fn
     )
@@ -255,7 +265,7 @@ def main():
     
     # Training setup - ensure criterion is on the right device
     criterion = nn.MSELoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0016, weight_decay=1e-5)
     scaler = GradScaler()
     
     # Training loop
@@ -280,12 +290,12 @@ def main():
                 #torch.cuda.empty_cache()
             
             if batch_idx % 10 == 0 and dist.get_rank() == 0:
-                mem = torch.cuda.memory_allocated(device) // 1024**2
-                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss:.4f} | GPU Mem: {mem}MB")
+                reserved= torch.cuda.memory_reserved(device) // 1024**2
+                print(f"Epoch {epoch+1} | Batch {batch_idx} | Loss: {loss:.4f} | GPU Reserved: {reserved}MB")
         
-        # Force garbage collection at the end of each epoch
-       # gc.collect()
-       # torch.cuda.empty_cache()
+        #Force garbage collection at the end of each epoch
+        #gc.collect()
+        #torch.cuda.empty_cache()
         
         if dist.get_rank() == 0:
             avg_loss = total_loss / len(dataloader)
