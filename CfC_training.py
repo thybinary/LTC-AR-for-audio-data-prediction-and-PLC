@@ -214,7 +214,7 @@ def main():
     print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
     
     # Configuration
-    input_folder = "/arc/project/st-mthorogo-1/CfC/corpus"
+    input_folder = "file_path"
     chunk_size = 512  # Reduced for memory savings
     seq_length = 3  # Reduced sequence length
     num_epochs = 50
