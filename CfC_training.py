@@ -19,34 +19,62 @@ from torch.cuda.amp import autocast, GradScaler
 import gc
 
 class StatefulCfC(CfC):
-    def __init__(self, input_size, wiring, **kwargs):
-        super().__init__(input_size, wiring, **kwargs)
+    def __init__(self, input_size, wiring, proj_size = None, **kwargs):
+        
+        super().__init__(input_size, wiring, proj_size = proj_size, **kwargs)
         self.hidden_registry = {}
         self.current_seq_id = None
+        self.mask_embedding = nn.Parameter(torch.randn(input_size))
 
-    def forward(self, x, hidden=None):
+    def forward(self, x, hidden=None, mask_indicator = None):
+        
+        # proper mask indication cause earlier it was ambiguous for the model to predict which one's masked data or not, that's why i was getting prediction in the -ves 
+        if mask_indicator is None: 
+            
+            mask_scale = mask_indicator.mean (dim=-1, keepdim=True)
+            
+            #mask_indicator = torch.zeros((x.shape[0], 1), device = x.device)
+        #else:
+            #mask_indicator = mask_indicator.mean(dim=-1, keepdim = True)
+        
+        #x_with_mask = torch.cat([x, mask_indicator], dim=-1)
+            x = x + mask_scale * self.mask_embedding
+        
         if hidden is None and self.current_seq_id in self.hidden_registry:
             hidden = self.hidden_registry[self.current_seq_id].to(x.device, non_blocking=True)
         
         output,new_hidden = super().forward(x,hidden)
+        #hidden states being properly initalised
+        self.hidden_registry[self.current_seq_id]=new_hidden.detach().cpu()
         return output, new_hidden
 
-   # def clear_hidden_states(self):
+    def clear_hidden_states(self):
         """Clear hidden states to free memory"""
-       # self.hidden_registry.clear()
+        self.hidden_registry.clear()
 
-def simulate_packet_loss(data, loss_rate, packet_size=100):
+def simulate_packet_loss(data, loss_rate, packet_size=100, fixed_pattern = False): #adding fixed pattern cause it gives the model a certain baseline to do its learning 
     """GPU-only packet loss simulation"""
     batch_size, seq_len = data.shape[0], data.shape[1]
     mask = torch.ones_like(data, device=data.device)
     
+    if fixed_pattern:
+        num_packets = max (1, seq_len // packet_size)
+        for b in range(batch_size):
+            
+            for i in range (0, num_packets, 3):
+                if i < num_packets: 
+                    start = i * packet_size
+                    end = min((i+1) * packet_size, seq_len)
+                    mask[b , start:end] = 0 
+    else:
+    
     # Simplified packet loss simulation
-    if seq_len >= packet_size:
-        packet_loss = torch.rand(batch_size, max(1, seq_len // packet_size), device=data.device) < loss_rate
-        for i in range(min(seq_len // packet_size, packet_loss.shape[1])):
-            start = i * packet_size
-            end = min((i+1) * packet_size, seq_len)
-            mask[:, start:end] = ~packet_loss[:, [i]].unsqueeze(-1)
+        if seq_len >= packet_size:
+            packet_loss = torch.rand(batch_size, max(1, seq_len // packet_size), device=data.device) < loss_rate
+            for i in range(min(seq_len // packet_size, packet_loss.shape[1])):
+                start = i * packet_size
+                end = min((i+1) * packet_size, seq_len)
+                mask[:, start:end] = ~packet_loss[:, [i]].unsqueeze(-1)
     
     return data * mask, mask
 
@@ -129,81 +157,73 @@ def collate_fn(batch):
     seqs, ids = zip(*batch)
     return torch.stack(seqs), list(ids)
         
-def train_sequence(model, scaler, sequence, seq_ids, criterion, optimizer, device, grad_accumulation_steps=4):
-    """Memory-optimized training step with gradient accumulation"""
+def train_sequence_improved(model, scaler, sequence, seq_ids, criterion, optimizer, device, grad_accumulation_steps=4, tbptt_steps=4):
     model.module.current_seq_id = seq_ids[0]
+    sequence = sequence.to(device, non_blocking=True)
+    batch_size, seq_len, chunk_size = sequence.shape
     
-    # Initialize hidden state
+    # Zero gradients at start of accumulation step
+    if not hasattr(train_sequence_improved, "step"):
+        train_sequence_improved.step = 0
+    train_sequence_improved.step += 1
+    
+    if train_sequence_improved.step % grad_accumulation_steps == 1:
+        optimizer.zero_grad(set_to_none=True)
+    
+    # Create packet loss simulation once for the entire sequence
+    corrupted, mask = simulate_packet_loss(sequence, 0.1)
+    
+    mask_indicator = 1.0 - mask
+    
+    # More controlled TBPTT
+    total_loss = 0.0
     hidden = None
-    if model.module.current_seq_id in model.module.hidden_registry:
-        hidden = model.module.hidden_registry[model.module.current_seq_id].to(device)
     
-    # Move data to GPU - explicitly specify device (hmmm something looks phishy)
-    sequence = sequence.to(device, non_blocking=True).unsqueeze(-1)
-    batch_size, seq_len = sequence.size(0), sequence.size(1)
-    
-    # Only zero gradients at the start of accumulation steps
-    if hasattr(train_sequence, 'acc_step_counter'):
-        train_sequence.acc_step_counter += 1
-    else:
-        train_sequence.acc_step_counter = 0
+    # Process sequence in chunks of tbptt_steps
+    for t_start in range(0, seq_len, tbptt_steps):
+        t_end = min(t_start + tbptt_steps, seq_len)
+        chunk_outputs = []
         
-    if train_sequence.acc_step_counter % grad_accumulation_steps == 0:
-        optimizer.zero_grad(set_to_none= True)
-    
-    
-    # Process sequence in smaller chunks to save memory
-    with torch.cuda.amp.autocast():
-        corrupted, mask = simulate_packet_loss(sequence, 0.1)
-        outputs = []
+        # Forward pass for this chunk
+        for t in range(t_start, t_end):
+            out, hidden = model(corrupted[:, t], hidden, mask_indicator=mask_indicator[:,t])
+            chunk_outputs.append(out)
         
+        # Stack outputs for this chunk
+        chunk_out = torch.stack(chunk_outputs, dim=1)
         
-        # Batch forward passes over time steps , a change was made here from "sequence.size(1)" to "seq_len"
-        for t in range(seq_len):
-            output, hidden = model(corrupted[:, t], hidden)
-            outputs.append(output)
+        # Calculate loss for this chunk
+        chunk_target = sequence[:, t_start:t_end]
+        chunk_mask = mask[:, t_start:t_end]
+        #chunk_loss = criterion(chunk_out * chunk_mask, chunk_target * chunk_mask)
+        unmasked_loss = criterion(chunk_out * chunk_mask, chunk_target * chunk_mask)
         
-        # Combine outputs and calculate loss
-        outputs = torch.stack(outputs, dim=1)
-        loss = criterion(outputs * mask, sequence * mask) #calculates loss only on the masked regions 
-    
+        if torch.any(chunk_mask < 1.0):
+            inv_mask = 1.0 - chunk_mask
+            masked_loss =  criterion(chunk_out * inv_mask, chunk_target * inv_mask)
+        
+        #giving higher weight to masked regions 
+            chunk_loss = unmasked_loss + 3.0 * masked_loss
+        else:
+            chunk_loss = unmasked_loss
             
-         # Detach hidden state. This is what needs to be optimised cause commenting this out leads to "leaked semaphore objects"
-        #hidden = hidden.detach()
-    
-    # Scale loss by accumulation steps
-    scaled_loss = loss / grad_accumulation_steps
-    
-    # Backpropagate with scaler. Other alt: using Truncated Backpropagation Through Time (TBPTT): breaks down the sequence into smaller chunks and performs backpropagation only over these chunks, effectively truncating the backpropagation process
-    #scaler.scale(scaled_loss).backward(retain_graph=True) #keeping the graph alive by not freeing it up 
-    # Only update parameters at the end of accumulation steps or what we can do is "if this is not the final accumulation step, retain the graph".
-    if (train_sequence.acc_step_counter + 1) % grad_accumulation_steps == 0:
-        scaler.scale(scaled_loss).backward() #Final step in accumulation: no need to backward pass 
+        # Scale loss and backward
+        scaled_loss = chunk_loss / ((seq_len + tbptt_steps - 1) // tbptt_steps) / grad_accumulation_steps
+        scaler.scale(scaled_loss).backward()
         
-        # Clip gradients
+        # Detach hidden state for next chunk
+        hidden = hidden.detach()
+        
+        total_loss += chunk_loss.item()
+    
+    # Step optimizer at the end of accumulation steps
+    if train_sequence_improved.step % grad_accumulation_steps == 0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-        
         scaler.step(optimizer)
         scaler.update()
-        
-        #conditional detachment: truncating the graph aka TBPTT
-        hidden=hidden.detach()
-    else:
-        scaler.scale(scaled_loss).backward(retain_graph=True)
     
-    # Save hidden state to CPU to free GPU memory - explicitly move to CPU. We are going make a conditional move of the hidden states from the GPU to CPU: when GPU mem exceeds 80% automatically move them to the CPU
-    if torch.cuda.memory_reserved(device) / torch.cuda.get_device_properties(device).total_memory < 0.8:
-         model.module.hidden_registry[model.module.current_seq_id] = hidden
-    else: 
-        model.module.hidden_registry[model.module.current_seq_id] = hidden.detach().cpu()
-    
-    # Force garbage collection
-    #del hidden, output, corrupted, mask
-    #torch.cuda.empty_cache()
-    
-    #loss_value = loss.item()
-    return loss.item()
+    return total_loss
 
 def main():
     # Initialize distributed processing
@@ -214,39 +234,40 @@ def main():
     print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
     
     # Configuration
-    input_folder = "file_path"
+    input_folder = "input folder path here"
     chunk_size = 512  # Reduced for memory savings
-    seq_length = 3  # Reduced sequence length
+    seq_length = 8  # Reduced sequence length
     num_epochs = 50
     batch_size = 16  # Reduced batch size
     grad_accumulation_steps = 4  # Accumulate gradients over 4 steps (effective batch size: 16)
+    tbptt_steps = 4
     
     # Model setup - reduced size
-    wiring = AutoNCP(64, 1) 
-    model = StatefulCfC(1, wiring).to(device)
-    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
+    wiring = AutoNCP(256, 128) 
+    model = StatefulCfC(input_size=chunk_size, wiring = wiring, proj_size = chunk_size ).to(device) # proj_size outputs a 512‑dimensional vector per time step
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
     
     # Dataset and DataLoader
     dataset = AudioDataset(
         input_folder, 
         chunk_size, 
         seq_length, 
-        max_files=3968  # Limit number of files for testing
-    )
+        max_files=1200  # Limit number of files for testing
+    ) 
     
     sampler = DistributedSampler(
         dataset,
         num_replicas=dist.get_world_size(),
         rank=dist.get_rank(),
         shuffle=True,
-        drop_last=True
+        #drop_last=True
     )
     
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=2,  # Reduced worker count
+        num_workers=2, 
         pin_memory=True, # pin_memory argument, which defaults to False. When using a GPU it’s better to set pin_memory=True, this instructs DataLoader to use pinned memory and enables faster and asynchronous memory copy from the host to the GPU.
         persistent_workers=True,
         collate_fn=collate_fn
@@ -281,7 +302,7 @@ def main():
         
         for batch_idx, (sequences, seq_ids) in enumerate(dataloader):
             # Pass the device explicitly to train_sequence
-            loss = train_sequence(model, scaler, sequences, seq_ids, criterion, optimizer, device, grad_accumulation_steps)
+            loss = train_sequence_improved(model, scaler, sequences, seq_ids, criterion, optimizer, device, grad_accumulation_steps)
             total_loss += loss
             
             # More frequent memory cleanup
@@ -302,7 +323,7 @@ def main():
             print(f"Epoch {epoch+1} Completed | Avg Loss: {avg_loss:.4f}")
             # Save model less frequently
             if (epoch + 1) % 5 == 0:
-                torch.save(model.module.state_dict(), f"model_epoch_{epoch}.pth")
+                torch.save(model.module.state_dict(), f"model_epoch_{epoch}.pth") #Instead of saving a module directly, for compatibility reasons it is recommended to instead save only its state dict.
     
     if dist.get_rank() == 0:
         print("Training completed successfully!")
