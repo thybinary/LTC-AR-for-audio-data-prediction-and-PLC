@@ -29,7 +29,7 @@ class StatefulCfC(CfC):
     def forward(self, x, hidden=None, mask_indicator = None):
         
         # proper mask indication cause earlier it was ambiguous for the model to predict which one's masked data or not, that's why i was getting prediction in the -ves 
-        if mask_indicator is None: 
+        if mask_indicator is not None: # the BIGGEST bug ever, it was set to "is None" so this entire time the mean was being calculated on mask = None values. So essentially the code trained on uncorrupted data without having to predict the missing data. lol
             
             mask_scale = mask_indicator.mean (dim=-1, keepdim=True)
             
@@ -68,7 +68,7 @@ def simulate_packet_loss(data, loss_rate, packet_size=100, fixed_pattern = False
                     mask[b , start:end] = 0 
     else:
     
-    # Simplified packet loss simulation
+    # random number generator packet loss, if the random number is less than the loss rate then the packet gets dropped, if it is more than the packet stays intact
         if seq_len >= packet_size:
             packet_loss = torch.rand(batch_size, max(1, seq_len // packet_size), device=data.device) < loss_rate
             for i in range(min(seq_len // packet_size, packet_loss.shape[1])):
@@ -79,7 +79,7 @@ def simulate_packet_loss(data, loss_rate, packet_size=100, fixed_pattern = False
     return data * mask, mask
 
 class AudioDataset(Dataset):
-    def __init__(self, folder_path, chunk_size, seq_length=3, max_files=None):
+    def __init__(self, folder_path, chunk_size, seq_length=8, max_files=None):
         self.chunk_size = chunk_size
         self.seq_length = seq_length
         self.sequences = []
@@ -104,8 +104,9 @@ class AudioDataset(Dataset):
                     print(f"Sample rate: {sample_rate} Hz")
                     print(f"Duration: {len(audio)/sample_rate:.2f} seconds")
 
-                max_val = np.max(np.abs(audio)) or 1.0
-                audio = (audio.astype(np.float32) / max_val).reshape(-1)
+                # finds the maximum absolute value and handles the edge case where max_val might be 0 or 1.0 thus preventing division by zero
+                max_val = np.max(np.abs(audio)) or 1.0 #normalising the entire audio array by the obtained maximum value to prevent clipping (scaling it to -1.0 to 1.0)
+                audio = (audio.astype(np.float32) / max_val).reshape(-1) #flattens it and converts it to float32
 
                 # Subsample audio to reduce memory usage
                 num_chunks = len(audio) // chunk_size
@@ -203,7 +204,7 @@ def train_sequence_improved(model, scaler, sequence, seq_ids, criterion, optimiz
             masked_loss =  criterion(chunk_out * inv_mask, chunk_target * inv_mask)
         
         #giving higher weight to masked regions 
-            chunk_loss = unmasked_loss + 3.0 * masked_loss
+            chunk_loss = unmasked_loss + 5.0 * masked_loss #lets see what happens when the weighted loss is set at 5 and the seq_len=8 
         else:
             chunk_loss = unmasked_loss
             
@@ -234,15 +235,15 @@ def main():
     print(f"Process rank: {dist.get_rank()}, using GPU: {local_rank}")
     
     # Configuration
-    input_folder = "input folder path here"
+    input_folder = "/arc/project/st-mthorogo-1/CfC/corpus"
     chunk_size = 512  # Reduced for memory savings
     seq_length = 8  # Reduced sequence length
-    num_epochs = 50
+    num_epochs = 100
     batch_size = 16  # Reduced batch size
     grad_accumulation_steps = 4  # Accumulate gradients over 4 steps (effective batch size: 16)
     tbptt_steps = 4
     
-    # Model setup - reduced size
+    # Model setup 
     wiring = AutoNCP(256, 128) 
     model = StatefulCfC(input_size=chunk_size, wiring = wiring, proj_size = chunk_size ).to(device) # proj_size outputs a 512‑dimensional vector per time step
     model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
@@ -252,7 +253,7 @@ def main():
         input_folder, 
         chunk_size, 
         seq_length, 
-        max_files=1200  # Limit number of files for testing
+        max_files=3968  # Limit number of files for testing
     ) 
     
     sampler = DistributedSampler(
@@ -267,7 +268,7 @@ def main():
         dataset,
         batch_size=batch_size,
         sampler=sampler,
-        num_workers=2, 
+        num_workers=1,
         pin_memory=True, # pin_memory argument, which defaults to False. When using a GPU it’s better to set pin_memory=True, this instructs DataLoader to use pinned memory and enables faster and asynchronous memory copy from the host to the GPU.
         persistent_workers=True,
         collate_fn=collate_fn
@@ -286,7 +287,7 @@ def main():
     
     # Training setup - ensure criterion is on the right device
     criterion = nn.MSELoss().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0016, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0016, weight_decay=1e-4) #we can change this to 1e-2 or 1e-4 as well. It was set at 1e-5. 
     scaler = GradScaler()
     
     # Training loop
